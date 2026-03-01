@@ -1,0 +1,15 @@
+# Core simulation
+mujoco>=3.1.0
+gymnasium[mujoco]>=1.0.0
+
+# Reinforcement Learning
+stable-baselines3[extra]>=2.3.0
+
+# Visualization & Recording
+tensorboard>=2.15.0
+moviepy>=1.0.3
+imageio[ffmpeg]
+
+# Utilities
+numpy>=1.26.0
+tqdm

@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(sysctl:*)",
+      "WebFetch(domain:stable-baselines3.readthedocs.io)",
+      "WebFetch(domain:gymnasium.farama.org)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(source:*)",
+      "Bash(pip install:*)",
+      "Bash(python -c:*)",
+      "Bash(python:*)"
+    ]
+  }
+}
