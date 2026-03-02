@@ -28,7 +28,6 @@ def make_env(env_id: str, rank: int, seed: int = 0):
             env_id,
             forward_reward_weight=config.FORWARD_REWARD_WEIGHT,
             ctrl_cost_weight=config.CTRL_COST_WEIGHT,
-            contact_cost_weight=config.CONTACT_COST_WEIGHT,
             healthy_reward=config.HEALTHY_REWARD,
             healthy_z_range=config.HEALTHY_Z_RANGE,
         )

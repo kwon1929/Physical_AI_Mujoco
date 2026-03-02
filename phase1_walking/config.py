@@ -13,6 +13,7 @@ MENAGERIE_DIR = PROJECT_ROOT / "mujoco_menagerie"
 # ──────────────────────────────────────────────
 # Environment (Unitree G1)
 # ──────────────────────────────────────────────
+ENV_ID = "G1Walk-v0"
 N_ENVS = 4  # 병렬 환경 수
 
 # Reward weights

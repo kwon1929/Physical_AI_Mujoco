@@ -86,7 +86,7 @@ def record_video(
     vec_normalize_path: Path,
     video_dir: Path,
     video_length: int = 1000,
-    name_prefix: str = "humanoid_walking",
+    name_prefix: str = "g1_walking",
 ) -> Path:
     """학습된 에이전트의 비디오를 녹화.
 
@@ -175,7 +175,7 @@ def main():
         return
 
     print("=" * 60)
-    print(" Phase 1: Humanoid-v5 Evaluation")
+    print(" Phase 1: G1Walk-v0 Evaluation")
     print(f" Model: {model_path}")
     print("=" * 60)
 
@@ -200,7 +200,7 @@ def main():
         print(f"  Min/Max len:  {results['min_length']} / {results['max_length']}")
         print(f"  Success rate: {results['success_rate'] * 100:.0f}% (episodes >= 100 steps)")
 
-        # Phase 1 성공 기준 체크
+        # Phase 1 성공 기준 체크 (G1은 일단 서있기만 해도 절반의 성공)
         if results["mean_length"] >= 100:
             print(f"\n  [PASS] Phase 1 성공 기준 달성! (mean_length >= 100)")
         else:

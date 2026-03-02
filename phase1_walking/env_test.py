@@ -8,24 +8,18 @@ import numpy as np
 from phase1_walking.config import ENV_ID
 
 
-# Humanoid-v5 관측값 구조 (exclude_current_positions_from_observation=True 기본값)
+# G1-v0 관측값 구조 (81 dims)
 OBS_COMPONENTS = {
-    "qpos (joint positions, excl. x,y)": (0, 22),    # 22 dims
-    "qvel (joint velocities)":           (22, 45),    # 23 dims
-    "cinert (body inertias)":            (45, 175),   # 130 dims (13 bodies x 10)
-    "cvel (CoM velocities)":             (175, 253),  # 78 dims (13 bodies x 6)
-    "qfrc_actuator (actuator forces)":   (253, 270),  # 17 dims
-    "cfrc_ext (external forces)":        (270, 348),  # 78 dims (13 bodies x 6)
+    "z_height (골반 높이)":                    (0, 1),    # 1 dim
+    "orientation (골반 quaternion)":         (1, 5),    # 4 dims
+    "joint_pos (관절 각도, freejoint 제외)":   (5, 34),   # 29 dims
+    "qvel (전체 속도)":                      (34, 69),  # 35 dims
+    "sensor_data (IMU: gyro+accel)":         (69, 81),  # 12 dims
 }
 
-# Humanoid-v5 액추에이터 이름 (17개)
-ACTUATOR_NAMES = [
-    "abdomen_y", "abdomen_z", "abdomen_x",
-    "right_hip_x", "right_hip_z", "right_hip_y", "right_knee",
-    "left_hip_x", "left_hip_z", "left_hip_y", "left_knee",
-    "right_shoulder1", "right_shoulder2", "right_elbow",
-    "left_shoulder1", "left_shoulder2", "left_elbow",
-]
+# G1 액추에이터는 29개이나 편의상 개수만 사용
+ACTUATOR_COUNT = 29
+
 
 
 def print_env_info() -> None:
@@ -46,9 +40,7 @@ def print_env_info() -> None:
     print(f"  High: {env.action_space.high[0]:.2f}")
     print(f"Max episode steps: {env.spec.max_episode_steps}")
 
-    print(f"\n--- Actuators ({len(ACTUATOR_NAMES)}) ---")
-    for i, name in enumerate(ACTUATOR_NAMES):
-        print(f"  [{i:2d}] {name}")
+    print(f"\n--- Actuators ({ACTUATOR_COUNT}) ---")
 
     env.close()
 
@@ -106,9 +98,9 @@ def run_random_episodes(n_episodes: int = 5) -> None:
     env.close()
 
 
-def visualize_humanoid(n_steps: int = 500) -> None:
-    """MuJoCo 뷰어로 휴머노이드 시각화 (랜덤 액션)."""
-    print(f"\n--- Visualizing Humanoid (random actions, {n_steps} steps) ---")
+def visualize_g1(n_steps: int = 500) -> None:
+    """MuJoCo 뷰어로 G1 시각화 (랜덤 액션)."""
+    print(f"\n--- Visualizing G1 (random actions, {n_steps} steps) ---")
     print("  MuJoCo 뷰어 창이 열립니다. 닫으려면 창을 닫거나 Ctrl+C를 누르세요.")
 
     env = gym.make(ENV_ID, render_mode="human")
@@ -141,7 +133,7 @@ def main():
     run_random_episodes(n_episodes=5)
 
     # 4. 시각화 (마지막에 실행 - 창이 열림)
-    visualize_humanoid(n_steps=500)
+    visualize_g1(n_steps=500)
 
 
 if __name__ == "__main__":

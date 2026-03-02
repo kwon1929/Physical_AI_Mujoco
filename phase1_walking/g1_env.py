@@ -1,43 +1,33 @@
-"""Unitree G1 Walking Environment - Custom Gymnasium wrapper.
+"""Unitree G1 커스텀 Gymnasium 환경.
 
-G1 모델의 특성:
-  - 29 actuators (position control, kp=500)
-  - 35 DoF (6 free joint + 29 revolute)
-  - "stand" keyframe으로 초기화
-  - 관측값: qpos, qvel, gyro, accelerometer
-  - 액션: 29개 관절 목표 위치 (position control)
+MuJoCo Menagerie의 G1 모델을 사용하여 보행 학습을 위한 RL 환경.
+- Position control (29 actuators)
+- 전진 보행 보상 + 생존 보상 - 제어 비용
+- "stand" 키프레임에서 시작
 """
 import numpy as np
-import mujoco
 import gymnasium as gym
 from gymnasium import spaces
-from pathlib import Path
+import mujoco
+
+from phase1_walking.config import MENAGERIE_DIR
 
 
 class G1WalkEnv(gym.Env):
     """Unitree G1 보행 학습 환경.
 
-    Observation (97 dims):
-        - qpos[2:] : 관절 위치 (freejoint z + quat 제외한 x,y 제외) → 34 dims
-        - qvel     : 관절 속도 → 35 dims
-        - gyro(torso) + accel(torso): IMU 센서 → 6 dims
-        - gyro(pelvis) + accel(pelvis): IMU 센서 → 6 dims
-        - 이전 액션: → 29 dims (total: 34+35+12+29 = 110 ... 아래 계산)
+    Observation (obs_dim):
+        - qpos: 관절 위치 (freejoint 7 + 29 joints = 36, x,y 제외 → 34)
+        - qvel: 관절 속도 (freejoint 6 + 29 = 35)
+        - 합계: 69 dims
 
-    실제:
-        qpos[2:] = nq - 2 = 37 - 2 = 35 dims (z제외한 freejoint 포함)
-        → 더 정확히: qpos[7:] = 30 dims (freejoint 7개 제외, 순수 관절만)
-        + qpos[2] = z height (1 dim)
-        + qpos[3:7] = orientation quaternion (4 dims)
-        총 qpos 부분: 1 + 4 + 30 = 35 dims
-        qvel: 35 dims
-        sensors: 12 dims
-        prev_action: 29 dims  (없어도 됨, 일단 제외)
-        ─────────
-        Total: 82 dims (without prev_action)
+    Action (29):
+        - 29개 액추에이터의 목표 관절 위치 오프셋 (현재 위치 + delta)
 
-    Action (29 dims):
-        각 관절의 목표 위치 오프셋. stand 키프레임 기준으로 delta를 더함.
+    Reward:
+        - 전진 속도 (x방향) * forward_reward_weight
+        - 생존 보상 (alive bonus)
+        - 제어 비용 패널티
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 50}
@@ -50,150 +40,155 @@ class G1WalkEnv(gym.Env):
         ctrl_cost_weight: float = 0.01,
         healthy_z_range: tuple[float, float] = (0.3, 1.2),
         max_episode_steps: int = 1000,
+        action_scale: float = 0.3,
     ):
         super().__init__()
 
-        # 모델 로드
-        xml_path = Path(__file__).resolve().parent.parent / "mujoco_menagerie" / "unitree_g1" / "scene.xml"
-        self.model = mujoco.MjModel.from_xml_path(str(xml_path))
+        self.render_mode = render_mode
+        self.forward_reward_weight = forward_reward_weight
+        self.healthy_reward = healthy_reward
+        self.ctrl_cost_weight = ctrl_cost_weight
+        self.healthy_z_range = healthy_z_range
+        self._max_episode_steps = max_episode_steps
+        self.action_scale = action_scale
+
+        # MuJoCo 모델 로드
+        xml_path = str(MENAGERIE_DIR / "unitree_g1" / "scene.xml")
+        self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data = mujoco.MjData(self.model)
 
-        # "stand" 키프레임 저장
-        key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, "stand")
-        self._stand_qpos = self.model.key_qpos[key_id].copy()
-        self._stand_ctrl = self.model.key_ctrl[key_id].copy()
-
-        # Reward 파라미터
-        self._forward_reward_weight = forward_reward_weight
-        self._healthy_reward = healthy_reward
-        self._ctrl_cost_weight = ctrl_cost_weight
-        self._healthy_z_range = healthy_z_range
-        self._max_episode_steps = max_episode_steps
-
-        # 액션 스페이스: 각 관절의 position target offset
-        # stand 키프레임 기준 +-0.5 rad 범위
-        nu = self.model.nu  # 29
-        self.action_space = spaces.Box(
-            low=-0.5, high=0.5, shape=(nu,), dtype=np.float32,
+        # "stand" 키프레임 ID
+        self._stand_key_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_KEY, "stand"
         )
 
-        # 관측 스페이스
+        # 키프레임의 기본 ctrl 값 저장 (standing pose)
+        mujoco.mj_resetDataKeyframe(self.model, self.data, self._stand_key_id)
+        self._default_ctrl = self.data.ctrl.copy()
+
+        # 공간 정의
+        self.nu = self.model.nu  # 29 actuators
         obs_size = self._get_obs().shape[0]
+
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float64,
+            low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float64
+        )
+        # 액션: [-1, 1] 범위 → action_scale 적용하여 기본 자세 대비 오프셋
+        self.action_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(self.nu,), dtype=np.float32
         )
 
-        # 렌더링
-        self.render_mode = render_mode
+        # 렌더러
         self._renderer = None
         if render_mode == "rgb_array":
             self._renderer = mujoco.Renderer(self.model, height=480, width=640)
 
-        # 내부 상태
         self._step_count = 0
 
     def _get_obs(self) -> np.ndarray:
-        """현재 상태에서 관측값 생성.
+        """관측값 생성: qpos (x,y 제외) + qvel."""
+        # qpos: [x, y, z, qw, qx, qy, qz, joint1, ..., joint29]
+        # x, y 위치는 제외 (에이전트가 위치에 무관하게 학습하도록)
+        qpos = self.data.qpos[2:].copy()  # z부터 시작 (34 dims)
+        qvel = self.data.qvel.copy()       # 전체 속도 (35 dims)
+        return np.concatenate([qpos, qvel])
 
-        구성:
-          - z_height (1): 골반 높이
-          - orientation (4): 골반 quaternion
-          - joint_pos (30): 관절 각도 (freejoint 제외)  여기서 nq=37, freejoint=7, so 30
-          - qvel (35): 전체 속도
-          - sensor_data: gyro + accel (12)
-        Total: 1 + 4 + 30 + 35 + 12 = 82
-        """
-        z_height = self.data.qpos[2:3]           # 1 dim
-        orientation = self.data.qpos[3:7]         # 4 dims (quaternion)
-        joint_pos = self.data.qpos[7:]            # 30 dims
-        qvel = self.data.qvel                     # 35 dims
-        sensor_data = self.data.sensordata.copy() # 12 dims (4 sensors x 3)
+    @property
+    def pelvis_height(self) -> float:
+        """골반 높이 (z 좌표)."""
+        return self.data.qpos[2]
 
-        return np.concatenate([
-            z_height,
-            orientation,
-            joint_pos,
-            qvel,
-            sensor_data,
-        ])
+    @property
+    def is_healthy(self) -> bool:
+        """로봇이 건강한 상태인지 (넘어지지 않았는지)."""
+        z = self.pelvis_height
+        return self.healthy_z_range[0] < z < self.healthy_z_range[1]
 
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-
-        # stand 키프레임으로 초기화
-        mujoco.mj_resetData(self.model, self.data)
-        self.data.qpos[:] = self._stand_qpos
-        self.data.ctrl[:] = self._stand_ctrl
-
-        # 약간의 랜덤 노이즈 추가 (다양한 초기 상태)
-        noise = self.np_random.uniform(-0.005, 0.005, size=self.data.qpos.shape)
-        noise[:2] = 0  # x, y 위치는 변경하지 않음
-        noise[2] = 0   # z 높이도 변경하지 않음
-        noise[3:7] = 0  # quaternion도 변경하지 않음
-        self.data.qpos += noise
-
-        mujoco.mj_forward(self.model, self.data)
-
-        self._step_count = 0
-        self._prev_x_pos = self.data.qpos[0]
-
-        return self._get_obs(), {}
+    @property
+    def x_velocity(self) -> float:
+        """x 방향 속도 (전진 속도)."""
+        return self.data.qvel[0]
 
     def step(self, action: np.ndarray):
-        # 이전 x 위치 저장
+        # 이전 x 위치 기록
         x_before = self.data.qpos[0]
 
-        # 액션 적용: stand 키프레임 ctrl + action offset
-        self.data.ctrl[:] = self._stand_ctrl + action
+        # 액션 적용: 기본 자세 + 스케일된 오프셋
+        self.data.ctrl[:] = self._default_ctrl + action * self.action_scale
 
         # 시뮬레이션 스텝 (여러 substep)
-        n_substeps = 10  # model timestep * n_substeps = control timestep
-        for _ in range(n_substeps):
-            mujoco.mj_step(self.model, self.data)
+        mujoco.mj_step(self.model, self.data)
 
+        x_after = self.data.qpos[0]
         self._step_count += 1
 
         # 관측값
         obs = self._get_obs()
 
         # 보상 계산
-        x_after = self.data.qpos[0]
-        forward_velocity = (x_after - x_before) / (self.model.opt.timestep * n_substeps)
-
-        forward_reward = self._forward_reward_weight * forward_velocity
-        healthy_reward = self._healthy_reward if self._is_healthy() else 0.0
-        ctrl_cost = self._ctrl_cost_weight * np.sum(np.square(action))
+        dt = self.model.opt.timestep
+        forward_reward = self.forward_reward_weight * (x_after - x_before) / dt
+        healthy_reward = self.healthy_reward if self.is_healthy else 0.0
+        ctrl_cost = self.ctrl_cost_weight * np.sum(np.square(action))
 
         reward = forward_reward + healthy_reward - ctrl_cost
 
         # 종료 조건
-        terminated = not self._is_healthy()
+        terminated = not self.is_healthy
         truncated = self._step_count >= self._max_episode_steps
 
         info = {
-            "forward_velocity": forward_velocity,
+            "x_position": x_after,
+            "x_velocity": (x_after - x_before) / dt,
+            "pelvis_height": self.pelvis_height,
             "forward_reward": forward_reward,
             "healthy_reward": healthy_reward,
             "ctrl_cost": ctrl_cost,
-            "z_height": self.data.qpos[2],
         }
+
+        if self.render_mode == "rgb_array":
+            info["rgb_array"] = self.render()
 
         return obs, reward, terminated, truncated, info
 
-    def _is_healthy(self) -> bool:
-        """골반 높이가 범위 내에 있으면 'healthy'."""
-        z = self.data.qpos[2]
-        return self._healthy_z_range[0] < z < self._healthy_z_range[1]
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+
+        # "stand" 키프레임으로 리셋
+        mujoco.mj_resetDataKeyframe(self.model, self.data, self._stand_key_id)
+
+        # 약간의 노이즈 추가 (탐색 유도)
+        noise_scale = 0.01
+        self.data.qpos[7:] += self.np_random.uniform(
+            -noise_scale, noise_scale, size=self.model.nq - 7
+        )
+        self.data.qvel[:] += self.np_random.uniform(
+            -noise_scale, noise_scale, size=self.model.nv
+        )
+
+        mujoco.mj_forward(self.model, self.data)
+        self._step_count = 0
+
+        obs = self._get_obs()
+        info = {"x_position": self.data.qpos[0], "pelvis_height": self.pelvis_height}
+
+        return obs, info
 
     def render(self):
-        if self.render_mode == "human":
-            # human 모드는 별도 뷰어 필요 (view_g1.py 사용)
-            pass
-        elif self.render_mode == "rgb_array":
+        if self.render_mode == "rgb_array" and self._renderer is not None:
             self._renderer.update_scene(self.data)
             return self._renderer.render()
+        return None
 
     def close(self):
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
+
+
+# Gymnasium 환경 등록
+gym.register(
+    id="G1Walk-v0",
+    entry_point="phase1_walking.g1_env:G1WalkEnv",
+    max_episode_steps=1000,
+)
