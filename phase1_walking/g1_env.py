@@ -9,6 +9,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 import mujoco
+import mujoco.viewer
 
 from phase1_walking.config import MENAGERIE_DIR
 
@@ -28,6 +29,10 @@ class G1WalkEnv(gym.Env):
         - 전진 속도 (x방향) * forward_reward_weight
         - 생존 보상 (alive bonus)
         - 제어 비용 패널티
+
+    Frame Skip:
+        - frame_skip=5 (Humanoid-v5와 동일)
+        - 1 env step = 5 physics steps
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 50}
@@ -36,11 +41,12 @@ class G1WalkEnv(gym.Env):
         self,
         render_mode: str | None = None,
         forward_reward_weight: float = 1.25,
-        healthy_reward: float = 2.0,
-        ctrl_cost_weight: float = 0.01,
+        healthy_reward: float = 5.0,
+        ctrl_cost_weight: float = 0.1,
         healthy_z_range: tuple[float, float] = (0.3, 1.2),
         max_episode_steps: int = 1000,
         action_scale: float = 0.3,
+        frame_skip: int = 5,
     ):
         super().__init__()
 
@@ -51,11 +57,15 @@ class G1WalkEnv(gym.Env):
         self.healthy_z_range = healthy_z_range
         self._max_episode_steps = max_episode_steps
         self.action_scale = action_scale
+        self.frame_skip = frame_skip
 
         # MuJoCo 모델 로드
         xml_path = str(MENAGERIE_DIR / "unitree_g1" / "scene.xml")
         self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data = mujoco.MjData(self.model)
+
+        # Effective dt (model timestep * frame_skip)
+        self.dt = self.model.opt.timestep * self.frame_skip
 
         # "stand" 키프레임 ID
         self._stand_key_id = mujoco.mj_name2id(
@@ -80,6 +90,7 @@ class G1WalkEnv(gym.Env):
 
         # 렌더러
         self._renderer = None
+        self._viewer = None
         if render_mode == "rgb_array":
             self._renderer = mujoco.Renderer(self.model, height=480, width=640)
 
@@ -116,8 +127,9 @@ class G1WalkEnv(gym.Env):
         # 액션 적용: 기본 자세 + 스케일된 오프셋
         self.data.ctrl[:] = self._default_ctrl + action * self.action_scale
 
-        # 시뮬레이션 스텝 (여러 substep)
-        mujoco.mj_step(self.model, self.data)
+        # 시뮬레이션 스텝 (frame_skip만큼 반복)
+        for _ in range(self.frame_skip):
+            mujoco.mj_step(self.model, self.data)
 
         x_after = self.data.qpos[0]
         self._step_count += 1
@@ -126,8 +138,7 @@ class G1WalkEnv(gym.Env):
         obs = self._get_obs()
 
         # 보상 계산
-        dt = self.model.opt.timestep
-        forward_reward = self.forward_reward_weight * (x_after - x_before) / dt
+        forward_reward = self.forward_reward_weight * (x_after - x_before) / self.dt
         healthy_reward = self.healthy_reward if self.is_healthy else 0.0
         ctrl_cost = self.ctrl_cost_weight * np.sum(np.square(action))
 
@@ -139,7 +150,7 @@ class G1WalkEnv(gym.Env):
 
         info = {
             "x_position": x_after,
-            "x_velocity": (x_after - x_before) / dt,
+            "x_velocity": (x_after - x_before) / self.dt,
             "pelvis_height": self.pelvis_height,
             "forward_reward": forward_reward,
             "healthy_reward": healthy_reward,
@@ -178,12 +189,25 @@ class G1WalkEnv(gym.Env):
         if self.render_mode == "rgb_array" and self._renderer is not None:
             self._renderer.update_scene(self.data)
             return self._renderer.render()
+        elif self.render_mode == "human":
+            if self._viewer is None:
+                self._viewer = mujoco.viewer.launch_passive(self.model, self.data)
+                # 카메라 위치 설정
+                self._viewer.cam.distance = 5.0
+                self._viewer.cam.azimuth = 45
+                self._viewer.cam.elevation = -15
+
+            # 뷰어 동기화
+            self._viewer.sync()
         return None
 
     def close(self):
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
+        if self._viewer is not None:
+            self._viewer.close()
+            self._viewer = None
 
 
 # Gymnasium 환경 등록
