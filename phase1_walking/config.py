@@ -16,12 +16,12 @@ MENAGERIE_DIR = PROJECT_ROOT / "mujoco_menagerie"
 ENV_ID = "G1Walk-v0"
 N_ENVS = 4  # 병렬 환경 수
 
-# Reward weights (Humanoid-v5와 동일하게 설정)
-FORWARD_REWARD_WEIGHT = 1.25
-CTRL_COST_WEIGHT = 0.1     # Humanoid-v5와 동일
-HEALTHY_REWARD = 5.0       # Humanoid-v5와 동일 (서있기 보상)
+# Reward weights (극단적 조정: 걷기 강제 유도)
+FORWARD_REWARD_WEIGHT = 25.0  # 1.25 → 25.0 (20배! 전진 최우선)
+CTRL_COST_WEIGHT = 0.1        # 유지
+HEALTHY_REWARD = 0.5          # 5.0 → 0.5 (10배 감소, 서있기만 하면 손해)
 HEALTHY_Z_RANGE = (0.3, 1.2)  # G1 pelvis 높이 범위 (stand ~0.79m)
-FRAME_SKIP = 5             # Humanoid-v5와 동일 (1 step = 5 physics steps)
+FRAME_SKIP = 5                # Humanoid-v5와 동일 (1 step = 5 physics steps)
 
 # ──────────────────────────────────────────────
 # PPO Hyperparameters
