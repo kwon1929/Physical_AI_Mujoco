@@ -1,10 +1,17 @@
-"""Unitree G1 개선 환경 v2 - Action Rate Penalty + Foot Contact
+"""Unitree G1 환경 v3 - Lean Walking (단순화, 걷기 집중)
 
-개선사항:
-1. Action Rate Penalty: 급격한 동작 변화 억제
-2. Foot Contact Reward: 교대로 발 딛기 유도
-3. Forward Progress Tracking: 실제 전진 거리 추적
-4. Smooth Reward Shaping: Reward explosion 방지
+V2 실패 원인:
+- 과도한 페널티로 총 reward 음수
+- Tanh 정규화로 forward reward 너무 작음
+- 로봇이 바로 넘어짐
+
+V3 개선사항:
+- Forward reward: 선형 (velocity_x * 10.0)
+- Healthy reward: 5.0 (높게)
+- 모든 페널티 제거 (ctrl_cost만 0.001로 최소화)
+- Action scale 증가 (0.3 → 0.7)
+- Termination 완화 (z >= 0.25m)
+- Observation에 속도 + 발 접촉 포함
 """
 import numpy as np
 import gymnasium as gym
@@ -15,29 +22,23 @@ import mujoco.viewer
 from phase1_walking.config import MENAGERIE_DIR
 
 
-class G1WalkEnvV2(gym.Env):
-    """Unitree G1 보행 학습 환경 v2 (개선된 보상 함수)."""
+class G1WalkEnvV3(gym.Env):
+    """Unitree G1 보행 학습 환경 v3 (Lean Walking)."""
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 50}
 
     def __init__(
         self,
         render_mode: str | None = None,
-        # Forward reward - Normalized
-        forward_reward_weight: float = 1.0,  # 정규화된 버전
-        # Penalties
-        ctrl_cost_weight: float = 0.01,
-        action_rate_weight: float = 0.1,  # NEW: 액션 변화율 페널티
-        energy_weight: float = 0.001,  # NEW: 에너지 소비 페널티
-        # Contact rewards
-        foot_contact_reward: float = 0.5,  # NEW: 발 접촉 보상
-        contact_consistency_weight: float = 0.2,  # NEW: 교대로 걷기 유도
+        # Reward weights (단순화!)
+        forward_reward_weight: float = 10.0,  # 선형, 높게
+        ctrl_cost_weight: float = 0.001,  # 최소화
+        healthy_reward: float = 5.0,  # 매 스텝 높은 보상
         # Health
-        healthy_reward: float = 0.2,  # 낮춤
-        healthy_z_range: tuple[float, float] = (0.3, 1.2),
+        healthy_z_range: tuple[float, float] = (0.25, 1.5),  # 완화
         # Other
         max_episode_steps: int = 1000,
-        action_scale: float = 0.5,  # 0.3 → 0.5로 증가
+        action_scale: float = 0.7,  # 증가 (0.3 → 0.7)
         frame_skip: int = 5,
     ):
         super().__init__()
@@ -45,10 +46,6 @@ class G1WalkEnvV2(gym.Env):
         self.render_mode = render_mode
         self.forward_reward_weight = forward_reward_weight
         self.ctrl_cost_weight = ctrl_cost_weight
-        self.action_rate_weight = action_rate_weight
-        self.energy_weight = energy_weight
-        self.foot_contact_reward = foot_contact_reward
-        self.contact_consistency_weight = contact_consistency_weight
         self.healthy_reward = healthy_reward
         self.healthy_z_range = healthy_z_range
         self._max_episode_steps = max_episode_steps
@@ -75,12 +72,22 @@ class G1WalkEnvV2(gym.Env):
         # 공간 정의
         self.nu = self.model.nu  # 29 actuators
 
-        # 상태 추적 변수 먼저 초기화 (_get_obs에서 사용됨)
+        # 상태 추적 변수 먼저 초기화
         self._step_count = 0
-        self._prev_action = np.zeros(self.nu)
         self._total_forward_distance = 0.0
         self._prev_x = 0.0
-        self._prev_foot_contacts = np.array([0.0, 0.0])  # [left, right]
+
+        # Foot geom IDs
+        try:
+            self._left_foot_geom_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, "left_ankle_roll_link"
+            )
+            self._right_foot_geom_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, "right_ankle_roll_link"
+            )
+        except:
+            self._left_foot_geom_id = self.model.ngeom - 2
+            self._right_foot_geom_id = self.model.ngeom - 1
 
         # 이제 obs_size 계산 가능
         obs_size = self._get_obs().shape[0]
@@ -98,29 +105,19 @@ class G1WalkEnvV2(gym.Env):
         if render_mode == "rgb_array":
             self._renderer = mujoco.Renderer(self.model, height=480, width=640)
 
-        # Foot geom IDs (G1 모델에서 발 geom 찾기 - 실제 이름 확인 필요)
-        try:
-            self._left_foot_geom_id = mujoco.mj_name2id(
-                self.model, mujoco.mjtObj.mjOBJ_GEOM, "left_ankle_roll_link"
-            )
-            self._right_foot_geom_id = mujoco.mj_name2id(
-                self.model, mujoco.mjtObj.mjOBJ_GEOM, "right_ankle_roll_link"
-            )
-        except:
-            # 대체: 마지막 두 geom 사용
-            self._left_foot_geom_id = self.model.ngeom - 2
-            self._right_foot_geom_id = self.model.ngeom - 1
-
     def _get_obs(self) -> np.ndarray:
-        """관측값: qpos (x,y 제외) + qvel + prev_action (temporal info)."""
+        """관측값: qpos (x,y 제외) + qvel (전체) + foot contacts.
+
+        V3에서는 속도 정보와 발 접촉을 명시적으로 포함.
+        """
         qpos = self.data.qpos[2:].copy()  # z부터 (34 dims)
-        qvel = self.data.qvel.copy()       # 전체 속도 (35 dims)
+        qvel = self.data.qvel.copy()       # 전체 속도 (35 dims) - 중요!
 
-        # Temporal information: 이전 액션 추가
-        prev_action = self._prev_action.copy()  # 29 dims
+        # 발 접촉 정보 추가
+        foot_contacts = self._get_foot_contacts()  # 2 dims
 
-        # Total: 34 + 35 + 29 = 98 dims
-        return np.concatenate([qpos, qvel, prev_action])
+        # Total: 34 + 35 + 2 = 71 dims
+        return np.concatenate([qpos, qvel, foot_contacts])
 
     def _get_foot_contacts(self) -> np.ndarray:
         """발바닥 접촉 감지 (0 or 1)."""
@@ -131,7 +128,6 @@ class G1WalkEnvV2(gym.Env):
             geom1 = contact.geom1
             geom2 = contact.geom2
 
-            # Check if either geom is a foot
             if geom1 == self._left_foot_geom_id or geom2 == self._left_foot_geom_id:
                 contacts[0] = 1.0
             if geom1 == self._right_foot_geom_id or geom2 == self._right_foot_geom_id:
@@ -165,61 +161,29 @@ class G1WalkEnvV2(gym.Env):
         # ===== 4. 관측값 =====
         obs = self._get_obs()
 
-        # ===== 5. 보상 계산 (개선된 버전) =====
+        # ===== 5. 보상 계산 (단순화!) =====
 
-        # 5.1 Forward Reward (Normalized & Clipped)
+        # 5.1 Forward Reward (선형, 높은 가중치)
         x_velocity = (x_after - x_before) / self.dt
-        # Sigmoid 정규화: -1 ~ +1 범위로 제한
-        forward_reward = self.forward_reward_weight * np.tanh(x_velocity)
+        forward_reward = self.forward_reward_weight * x_velocity  # 선형!
 
-        # 5.2 Healthy Reward (작게 유지)
+        # 5.2 Healthy Reward (높게 유지)
         healthy_reward = self.healthy_reward if self.is_healthy else 0.0
 
-        # 5.3 Control Cost (기존)
+        # 5.3 Control Cost (최소화)
         ctrl_cost = self.ctrl_cost_weight * np.sum(np.square(action))
 
-        # 5.4 Action Rate Penalty (NEW!)
-        # 급격한 액션 변화를 억제 → 부드러운 동작 유도
-        action_diff = action - self._prev_action
-        action_rate_cost = self.action_rate_weight * np.sum(np.square(action_diff))
+        # 5.4 총 보상 (단순!)
+        reward = forward_reward + healthy_reward - ctrl_cost
 
-        # 5.5 Energy Cost (NEW!)
-        # 실제 토크 × 속도로 에너지 소비 계산
-        torques = self.data.ctrl.copy()
-        velocities = self.data.qvel[6:].copy()  # 관절 속도만
-        energy_cost = self.energy_weight * np.sum(np.abs(torques * velocities))
-
-        # 5.6 Foot Contact Reward (NEW!)
-        # 교대로 발을 딛는 패턴 유도
-        foot_contacts = self._get_foot_contacts()
-
-        # 적어도 한 발은 땅에 닿아야 함 (안정성)
-        at_least_one_contact = np.any(foot_contacts > 0.5)
-        contact_stability = self.foot_contact_reward if at_least_one_contact else -0.5
-
-        # 교대로 걷기 유도 (한 발씩 번갈아 딛기)
-        # XOR 패턴: 한 발만 닿았을 때 보상
-        exclusive_contact = np.sum(foot_contacts) == 1.0
-        contact_consistency = (
-            self.contact_consistency_weight if exclusive_contact else 0.0
-        )
-
-        # ===== 6. 총 보상 =====
-        reward = (
-            forward_reward
-            + healthy_reward
-            + contact_stability
-            + contact_consistency
-            - ctrl_cost
-            - action_rate_cost
-            - energy_cost
-        )
-
-        # ===== 7. 종료 조건 =====
+        # ===== 6. 종료 조건 =====
         terminated = not self.is_healthy
         truncated = self._step_count >= self._max_episode_steps
 
-        # ===== 8. 정보 =====
+        # ===== 7. 정보 =====
+        forward_distance = max(0, x_after - x_before)
+        self._total_forward_distance += forward_distance
+
         info = {
             "x_position": x_after,
             "x_velocity": x_velocity,
@@ -227,22 +191,12 @@ class G1WalkEnvV2(gym.Env):
             "forward_reward": forward_reward,
             "healthy_reward": healthy_reward,
             "ctrl_cost": ctrl_cost,
-            "action_rate_cost": action_rate_cost,
-            "energy_cost": energy_cost,
-            "contact_stability": contact_stability,
-            "contact_consistency": contact_consistency,
-            "foot_contacts": foot_contacts,
             "total_forward_distance": self._total_forward_distance,
+            "foot_contacts": self._get_foot_contacts(),
         }
 
         if self.render_mode == "rgb_array":
             info["rgb_array"] = self.render()
-
-        # ===== 9. 상태 업데이트 =====
-        self._prev_action = action.copy()
-        forward_distance = max(0, x_after - x_before)  # 후진 무시
-        self._total_forward_distance += forward_distance
-        self._prev_foot_contacts = foot_contacts
 
         return obs, reward, terminated, truncated, info
 
@@ -265,10 +219,8 @@ class G1WalkEnvV2(gym.Env):
 
         # 상태 초기화
         self._step_count = 0
-        self._prev_action = np.zeros(self.nu)
         self._total_forward_distance = 0.0
         self._prev_x = self.data.qpos[0]
-        self._prev_foot_contacts = np.zeros(2)
 
         obs = self._get_obs()
         info = {
@@ -302,7 +254,7 @@ class G1WalkEnvV2(gym.Env):
 
 # Gymnasium 환경 등록
 gym.register(
-    id="G1Walk-v2",
-    entry_point="phase1_walking.g1_env_v2:G1WalkEnvV2",
+    id="G1Walk-v3",
+    entry_point="phase1_walking.g1_env_v3:G1WalkEnvV3",
     max_episode_steps=1000,
 )

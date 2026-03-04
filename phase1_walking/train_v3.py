@@ -1,4 +1,4 @@
-"""Train G1 with v2 environment (improved reward shaping)."""
+"""Train G1 with v3 environment (Lean Walking - Simplified)."""
 import multiprocessing
 from pathlib import Path
 
@@ -7,9 +7,9 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize, DummyVecEnv
 from stable_baselines3.common.callbacks import CallbackList
 
-from phase1_walking import config_v2 as config
+from phase1_walking import config_v3 as config
 from phase1_walking.callbacks import make_eval_callback, ProgressCallback
-from phase1_walking.g1_env_v2 import G1WalkEnvV2  # Import to register
+from phase1_walking.g1_env_v3 import G1WalkEnvV3  # Import to register
 
 
 def make_env(rank: int, seed: int = 0):
@@ -19,10 +19,6 @@ def make_env(rank: int, seed: int = 0):
             config.ENV_ID,
             forward_reward_weight=config.FORWARD_REWARD_WEIGHT,
             ctrl_cost_weight=config.CTRL_COST_WEIGHT,
-            action_rate_weight=config.ACTION_RATE_WEIGHT,
-            energy_weight=config.ENERGY_WEIGHT,
-            foot_contact_reward=config.FOOT_CONTACT_REWARD,
-            contact_consistency_weight=config.CONTACT_CONSISTENCY_WEIGHT,
             healthy_reward=config.HEALTHY_REWARD,
             healthy_z_range=config.HEALTHY_Z_RANGE,
             action_scale=config.ACTION_SCALE,
@@ -35,12 +31,17 @@ def make_env(rank: int, seed: int = 0):
 
 def main():
     print("=" * 60)
-    print(" 🚀 G1 Walking Training v2 (Improved Reward Shaping)")
+    print(" 🚀 G1 Walking Training v3 (Lean Walking)")
     print("=" * 60)
     print(f"\n📦 환경: {config.ENV_ID}")
     print(f"🔧 병렬 환경 수: {config.N_ENVS}")
     print(f"🎯 총 학습 스텝: {config.TOTAL_TIMESTEPS:,}")
-    print(f"💻 디바이스: {config.DEVICE}\n")
+    print(f"💻 디바이스: {config.DEVICE}")
+    print(f"\n⚡ 특징:")
+    print(f"   - Forward reward: {config.FORWARD_REWARD_WEIGHT} (선형)")
+    print(f"   - Healthy reward: {config.HEALTHY_REWARD}")
+    print(f"   - Action scale: {config.ACTION_SCALE}")
+    print(f"   - Ctrl cost: {config.CTRL_COST_WEIGHT} (최소화)\n")
 
     # 디렉토리 생성
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -69,7 +70,7 @@ def main():
     eval_env = VecNormalize(
         eval_env,
         norm_obs=True,
-        norm_reward=False,  # 평가 시에는 reward 정규화 안함
+        norm_reward=False,
         clip_obs=10.0,
         gamma=config.GAMMA,
         training=False,
@@ -138,8 +139,7 @@ def main():
     print(f"\n💾 모델 저장 위치: {config.MODEL_DIR}/")
     print(f"📊 로그 위치: {config.LOG_DIR}/")
     print(f"\n🎬 평가 실행:")
-    print(f"   python -m phase1_walking.evaluate_v2 --render")
-    print(f"   python -m phase1_walking.evaluate_v2 --record\n")
+    print(f"   python -m phase1_walking.evaluate_v3 --record\n")
 
     env.close()
 
