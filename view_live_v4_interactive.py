@@ -5,6 +5,7 @@ Run: python view_live_v4_interactive.py
 """
 import numpy as np
 import mujoco
+import mujoco.viewer
 from pathlib import Path
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
@@ -87,7 +88,7 @@ def main():
             print(f"{'='*60}")
 
             # Interactive viewer 실행
-            with mujoco.viewer.launch(mj_model, mj_data) as viewer:
+            with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
                 # 초기 카메라 위치 설정
                 viewer.cam.distance = 5.0
                 viewer.cam.azimuth = 45
@@ -108,6 +109,12 @@ def main():
 
                     # Forward kinematics
                     mujoco.mj_forward(mj_model, mj_data)
+
+                    # 뷰어 업데이트
+                    viewer.sync()
+
+                    # 짧은 대기 (실시간 시각화를 위해)
+                    time.sleep(0.01)
 
                     step_count += 1
 

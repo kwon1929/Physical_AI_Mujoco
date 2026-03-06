@@ -1,15 +1,15 @@
-"""Train G1 with v4 environment (Exponential Reward + Stability)."""
+"""Train G1 with v6 environment (V5 + Upright Bonus)."""
 import multiprocessing
-from pathlib import Path
 
 import gymnasium as gym
+import torch.nn as nn
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize, DummyVecEnv
 from stable_baselines3.common.callbacks import CallbackList
 
-from phase1_walking import config_v4 as config
+from phase1_walking import config_v6 as config
 from phase1_walking.callbacks import make_eval_callback, ProgressCallback
-from phase1_walking.g1_env_v4 import G1WalkEnvV4  # Import to register
+from phase1_walking.g1_env_v6 import G1WalkEnvV6  # noqa: F401 (register env)
 
 
 def make_env(rank: int, seed: int = 0):
@@ -17,9 +17,9 @@ def make_env(rank: int, seed: int = 0):
     def _init():
         env = gym.make(
             config.ENV_ID,
-            target_velocity=config.TARGET_VELOCITY,
             forward_reward_weight=config.FORWARD_REWARD_WEIGHT,
-            stability_reward_weight=config.STABILITY_REWARD_WEIGHT,
+            upright_reward_weight=config.UPRIGHT_REWARD_WEIGHT,
+            upright_sigma=config.UPRIGHT_SIGMA,
             healthy_reward=config.HEALTHY_REWARD,
             ctrl_cost_weight=config.CTRL_COST_WEIGHT,
             healthy_z_range=config.HEALTHY_Z_RANGE,
@@ -34,30 +34,29 @@ def make_env(rank: int, seed: int = 0):
 
 def main():
     print("=" * 60)
-    print(" 🚀 G1 Walking Training v4 (Exponential Reward + Stability)")
+    print(" G1 Walking Training v6 (V5 + Upright Bonus)")
+    print(" Ablation Step 1: upright_reward only")
     print("=" * 60)
-    print(f"\n📦 환경: {config.ENV_ID}")
-    print(f"🔧 병렬 환경 수: {config.N_ENVS}")
-    print(f"🎯 총 학습 스텝: {config.TOTAL_TIMESTEPS:,}")
-    print(f"💻 디바이스: {config.DEVICE}")
-    print(f"\n⚡ 특징 (MiniCheetah 기법):")
-    print(f"   - Target velocity: {config.TARGET_VELOCITY} m/s")
-    print(f"   - Forward reward: Exponential (목표 속도 기반)")
-    print(f"   - Stability reward: {config.STABILITY_REWARD_WEIGHT} (Roll/Pitch)")
-    print(f"   - Max Roll/Pitch: {config.MAX_ROLL_PITCH} rad (~45°)\n")
+    print(f"\n  ENV: {config.ENV_ID}")
+    print(f"  N_ENVS: {config.N_ENVS}")
+    print(f"  TOTAL_TIMESTEPS: {config.TOTAL_TIMESTEPS:,}")
+    print(f"  DEVICE: {config.DEVICE}")
+    print(f"\n  forward (linear * {config.FORWARD_REWARD_WEIGHT})")
+    print(f"  + upright ({config.UPRIGHT_REWARD_WEIGHT} * exp(-{config.UPRIGHT_SIGMA} * angle^2))")
+    print(f"  + healthy ({config.HEALTHY_REWARD})")
+    print(f"  - ctrl_cost ({config.CTRL_COST_WEIGHT})")
+    print(f"  termination: z>{config.HEALTHY_Z_RANGE[0]}m, roll/pitch<{config.MAX_ROLL_PITCH}rad\n")
 
-    # 디렉토리 생성
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
     config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # macOS에서 SubprocVecEnv 사용 시 필요
     try:
         multiprocessing.set_start_method("fork", force=True)
     except RuntimeError:
         pass
 
     # 환경 생성
-    print("🏗️  환경 생성 중...")
+    print("Creating environments...")
     env = SubprocVecEnv([make_env(i) for i in range(config.N_ENVS)])
     env = VecNormalize(
         env,
@@ -68,7 +67,6 @@ def main():
         gamma=config.GAMMA,
     )
 
-    # 평가용 환경 생성
     eval_env = DummyVecEnv([make_env(0)])
     eval_env = VecNormalize(
         eval_env,
@@ -79,7 +77,7 @@ def main():
         training=False,
     )
 
-    # 콜백 설정
+    # 콜백
     eval_callback = make_eval_callback(
         eval_env=eval_env,
         log_dir=config.LOG_DIR,
@@ -87,16 +85,14 @@ def main():
         eval_freq=config.EVAL_FREQ,
         n_eval_episodes=config.N_EVAL_EPISODES,
     )
-
     progress_callback = ProgressCallback(
         total_timesteps=config.TOTAL_TIMESTEPS,
         print_freq=10000,
     )
-
     callbacks = CallbackList([eval_callback, progress_callback])
 
-    # PPO 모델 생성
-    print("\n🤖 PPO 모델 생성 중...")
+    # PPO 모델
+    print("Creating PPO model...")
     model = PPO(
         "MlpPolicy",
         env,
@@ -112,7 +108,7 @@ def main():
         ent_coef=config.ENT_COEF,
         policy_kwargs={
             "net_arch": config.NET_ARCH,
-            "activation_fn": __import__("torch.nn", fromlist=["ReLU"]).ReLU,
+            "activation_fn": nn.ReLU,
             "log_std_init": config.LOG_STD_INIT,
             "ortho_init": config.ORTHO_INIT,
         },
@@ -121,28 +117,24 @@ def main():
         verbose=1,
     )
 
-    print(f"\n📊 TensorBoard: tensorboard --logdir {config.LOG_DIR}")
-    print("\n🎓 학습 시작...\n")
+    print(f"\nTensorBoard: tensorboard --logdir {config.LOG_DIR}")
+    print("\nTraining started...\n")
 
-    # 학습
     model.learn(
         total_timesteps=config.TOTAL_TIMESTEPS,
         callback=callbacks,
         progress_bar=True,
     )
 
-    # 최종 모델 저장
-    final_model_path = config.MODEL_DIR / "final_model"
-    model.save(str(final_model_path))
+    # 저장
+    model.save(str(config.MODEL_DIR / "final_model"))
     env.save(str(config.MODEL_DIR / "vec_normalize.pkl"))
 
     print("\n" + "=" * 60)
-    print(" ✅ 학습 완료!")
+    print(" Training complete!")
     print("=" * 60)
-    print(f"\n💾 모델 저장 위치: {config.MODEL_DIR}/")
-    print(f"📊 로그 위치: {config.LOG_DIR}/")
-    print(f"\n🎬 평가 실행:")
-    print(f"   python -m phase1_walking.evaluate_v4 --record\n")
+    print(f"\n  Model: {config.MODEL_DIR}/")
+    print(f"  Logs:  {config.LOG_DIR}/\n")
 
     env.close()
 

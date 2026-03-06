@@ -21,7 +21,9 @@
       "Bash(ls:*)",
       "Bash(while IFS= read -r line)",
       "Bash(done)",
-      "Bash(./venv/bin/python:*)"
+      "Bash(./venv/bin/python:*)",
+      "Bash(pkill:*)",
+      "Bash(./venv/bin/mjpython:*)"
     ]
   }
 }

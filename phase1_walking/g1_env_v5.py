@@ -1,15 +1,16 @@
-"""Unitree G1 환경 v4 - Exponential Reward + Stability
+"""Unitree G1 환경 v5 - Linear Forward + Stability Termination
 
-MiniCheetah 프로젝트에서 영감을 받은 개선사항:
-1. 지수 기반 reward: 목표 속도 달성 시 최대 보상
-2. 자세 안정성 보상: Pitch/Roll 각도 제어
-3. Roll/Pitch termination: 넘어짐 명확히 감지
-4. 에너지 효율성 추가
+V3 + V4 장점 결합:
+- V3에서: 선형 forward reward (서있으면 0, 걸어야 보상)
+- V4에서: Roll/Pitch termination (누워서 가기 방지)
+- healthy_reward 최소화 (서있기만 하면 손해)
+- healthy_z_range 강화 (z >= 0.5m, 누워서 가기 불가)
 
-V3 대비 개선:
-- V3: 선형 forward reward (무한정 증가)
-- V4: 지수 기반 (목표 속도 최적화)
-- V4: 자세 안정성 명시적 보상
+보상 구조:
+  reward = forward_velocity * 10.0  (선형, 걸어야만 보상)
+         + healthy_reward * 0.5     (서있기만으론 부족)
+         - ctrl_cost * 0.001       (최소 페널티)
+  termination: z < 0.5m OR roll/pitch > 0.8 rad
 """
 import numpy as np
 import gymnasium as gym
@@ -20,24 +21,21 @@ import mujoco.viewer
 from phase1_walking.config import MENAGERIE_DIR
 
 
-class G1WalkEnvV4(gym.Env):
-    """Unitree G1 보행 학습 환경 v4 (Exponential Reward + Stability)."""
+class G1WalkEnvV5(gym.Env):
+    """Unitree G1 보행 학습 환경 v5 (Linear Forward + Stability Termination)."""
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 50}
 
     def __init__(
         self,
         render_mode: str | None = None,
-        # Target velocity (MiniCheetah처럼)
-        target_velocity: float = 1.0,  # m/s 목표 속도
-        # Reward weights (지수 기반)
-        forward_reward_weight: float = 10.0,     # 전진 보상
-        stability_reward_weight: float = 5.0,    # 자세 안정성 보상 (NEW!)
-        healthy_reward: float = 3.0,             # 생존 보상 (약간 낮춤)
-        ctrl_cost_weight: float = 0.01,          # 토크 비용
-        # Health & Termination
-        healthy_z_range: tuple[float, float] = (0.25, 1.5),
-        max_roll_pitch: float = 0.8,  # NEW! 최대 roll/pitch (라디안)
+        # Reward weights (선형! 서있으면 0)
+        forward_reward_weight: float = 10.0,
+        healthy_reward: float = 0.5,        # 낮게 (서있기만으론 부족)
+        ctrl_cost_weight: float = 0.001,    # 최소화
+        # Termination (V4에서 가져옴)
+        healthy_z_range: tuple[float, float] = (0.5, 1.5),  # 강화! 0.25→0.5
+        max_roll_pitch: float = 0.8,        # ~45도, 누워서 가기 방지
         # Other
         max_episode_steps: int = 1000,
         action_scale: float = 0.7,
@@ -46,9 +44,7 @@ class G1WalkEnvV4(gym.Env):
         super().__init__()
 
         self.render_mode = render_mode
-        self.target_velocity = target_velocity
         self.forward_reward_weight = forward_reward_weight
-        self.stability_reward_weight = stability_reward_weight
         self.healthy_reward = healthy_reward
         self.ctrl_cost_weight = ctrl_cost_weight
         self.healthy_z_range = healthy_z_range
@@ -80,7 +76,6 @@ class G1WalkEnvV4(gym.Env):
         # 상태 추적 변수 먼저 초기화
         self._step_count = 0
         self._total_forward_distance = 0.0
-        self._prev_x = 0.0
 
         # Foot geom IDs
         try:
@@ -90,11 +85,11 @@ class G1WalkEnvV4(gym.Env):
             self._right_foot_geom_id = mujoco.mj_name2id(
                 self.model, mujoco.mjtObj.mjOBJ_GEOM, "right_ankle_roll_link"
             )
-        except:
+        except Exception:
             self._left_foot_geom_id = self.model.ngeom - 2
             self._right_foot_geom_id = self.model.ngeom - 1
 
-        # 이제 obs_size 계산 가능
+        # obs_size 계산
         obs_size = self._get_obs().shape[0]
 
         self.observation_space = spaces.Box(
@@ -111,125 +106,89 @@ class G1WalkEnvV4(gym.Env):
             self._renderer = mujoco.Renderer(self.model, height=480, width=640)
 
     def _get_obs(self) -> np.ndarray:
-        """관측값: qpos (x,y 제외) + qvel + foot contacts + orientation."""
+        """관측값: qpos (x,y 제외) + qvel + foot contacts."""
         qpos = self.data.qpos[2:].copy()  # z부터 (34 dims)
         qvel = self.data.qvel.copy()       # 전체 속도 (35 dims)
         foot_contacts = self._get_foot_contacts()  # 2 dims
-
-        # Total: 34 + 35 + 2 = 71 dims (V3와 동일)
+        # Total: 34 + 35 + 2 = 71 dims
         return np.concatenate([qpos, qvel, foot_contacts])
 
     def _get_foot_contacts(self) -> np.ndarray:
         """발바닥 접촉 감지 (0 or 1)."""
         contacts = np.zeros(2, dtype=np.float32)
-
         for i in range(self.data.ncon):
             contact = self.data.contact[i]
             geom1 = contact.geom1
             geom2 = contact.geom2
-
             if geom1 == self._left_foot_geom_id or geom2 == self._left_foot_geom_id:
                 contacts[0] = 1.0
             if geom1 == self._right_foot_geom_id or geom2 == self._right_foot_geom_id:
                 contacts[1] = 1.0
-
         return contacts
 
-    @property
-    def pelvis_height(self) -> float:
-        return self.data.qpos[2]
-
     def _get_euler_from_quat(self) -> tuple[float, float, float]:
-        """쿼터니언 → 오일러 각도 (roll, pitch, yaw) 변환.
-
-        MuJoCo qpos[3:7] = (w, x, y, z) 쿼터니언.
-        """
+        """쿼터니언 → 오일러 각도 (roll, pitch, yaw) 변환."""
         w, x, y, z = self.data.qpos[3:7]
-        # Roll (x-axis)
         sinr_cosp = 2.0 * (w * x + y * z)
         cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
         roll = np.arctan2(sinr_cosp, cosr_cosp)
-        # Pitch (y-axis)
         sinp = 2.0 * (w * y - z * x)
         pitch = np.arcsin(np.clip(sinp, -1.0, 1.0))
-        # Yaw (z-axis)
         siny_cosp = 2.0 * (w * z + x * y)
         cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
         yaw = np.arctan2(siny_cosp, cosy_cosp)
         return roll, pitch, yaw
 
     @property
+    def pelvis_height(self) -> float:
+        return self.data.qpos[2]
+
+    @property
     def roll(self) -> float:
-        """Roll 각도 (라디안)."""
         return self._get_euler_from_quat()[0]
 
     @property
     def pitch(self) -> float:
-        """Pitch 각도 (라디안)."""
         return self._get_euler_from_quat()[1]
 
     @property
     def is_healthy(self) -> bool:
-        """건강 상태: 높이 + Roll/Pitch 각도 체크."""
+        """높이 + Roll/Pitch 체크."""
         z = self.pelvis_height
         roll = abs(self.roll)
         pitch = abs(self.pitch)
-
         height_ok = self.healthy_z_range[0] < z < self.healthy_z_range[1]
         orientation_ok = (roll < self.max_roll_pitch) and (pitch < self.max_roll_pitch)
-
         return height_ok and orientation_ok
 
     def step(self, action: np.ndarray):
-        # ===== 1. 이전 상태 기록 =====
         x_before = self.data.qpos[0]
 
-        # ===== 2. 액션 적용 =====
+        # 액션 적용
         self.data.ctrl[:] = self._default_ctrl + action * self.action_scale
 
-        # ===== 3. 시뮬레이션 스텝 =====
+        # 시뮬레이션 스텝
         for _ in range(self.frame_skip):
             mujoco.mj_step(self.model, self.data)
 
         x_after = self.data.qpos[0]
         self._step_count += 1
 
-        # ===== 4. 관측값 =====
         obs = self._get_obs()
 
-        # ===== 5. 보상 계산 (지수 기반!) =====
-
-        # 5.1 Forward Reward (지수 기반, 목표 속도 최적화)
+        # ===== 보상 (단순! 선형!) =====
         x_velocity = (x_after - x_before) / self.dt
-        velocity_error = (x_velocity - self.target_velocity) ** 2
-        forward_reward = self.forward_reward_weight * np.exp(-velocity_error)
-
-        # 5.2 Stability Reward (자세 안정성)
-        roll_penalty = self.roll ** 2
-        pitch_penalty = self.pitch ** 2
-        stability_reward = self.stability_reward_weight * (
-            np.exp(-roll_penalty) + np.exp(-pitch_penalty)
-        ) / 2  # 평균
-
-        # 5.3 Healthy Reward
+        forward_reward = self.forward_reward_weight * x_velocity  # 선형
         healthy_reward = self.healthy_reward if self.is_healthy else 0.0
-
-        # 5.4 Control Cost (에너지 효율)
         ctrl_cost = self.ctrl_cost_weight * np.sum(np.square(action))
 
-        # 5.5 총 보상
-        reward = (
-            forward_reward
-            + stability_reward
-            + healthy_reward
-            - ctrl_cost
-        )
+        reward = forward_reward + healthy_reward - ctrl_cost
 
-        # ===== 6. 종료 조건 =====
+        # 종료 조건
         terminated = not self.is_healthy
         truncated = self._step_count >= self._max_episode_steps
 
-        # ===== 7. 정보 =====
+        # 정보
         forward_distance = max(0, x_after - x_before)
         self._total_forward_distance += forward_distance
 
@@ -240,7 +199,6 @@ class G1WalkEnvV4(gym.Env):
             "roll": self.roll,
             "pitch": self.pitch,
             "forward_reward": forward_reward,
-            "stability_reward": stability_reward,
             "healthy_reward": healthy_reward,
             "ctrl_cost": ctrl_cost,
             "total_forward_distance": self._total_forward_distance,
@@ -255,10 +213,8 @@ class G1WalkEnvV4(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        # "stand" 키프레임으로 리셋
         mujoco.mj_resetDataKeyframe(self.model, self.data, self._stand_key_id)
 
-        # 약간의 노이즈 추가
         noise_scale = 0.01
         self.data.qpos[7:] += self.np_random.uniform(
             -noise_scale, noise_scale, size=self.model.nq - 7
@@ -269,10 +225,8 @@ class G1WalkEnvV4(gym.Env):
 
         mujoco.mj_forward(self.model, self.data)
 
-        # 상태 초기화
         self._step_count = 0
         self._total_forward_distance = 0.0
-        self._prev_x = self.data.qpos[0]
 
         obs = self._get_obs()
         info = {
@@ -308,7 +262,7 @@ class G1WalkEnvV4(gym.Env):
 
 # Gymnasium 환경 등록
 gym.register(
-    id="G1Walk-v4",
-    entry_point="phase1_walking.g1_env_v4:G1WalkEnvV4",
+    id="G1Walk-v5",
+    entry_point="phase1_walking.g1_env_v5:G1WalkEnvV5",
     max_episode_steps=1000,
 )
