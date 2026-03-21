@@ -23,7 +23,8 @@
       "Bash(done)",
       "Bash(./venv/bin/python:*)",
       "Bash(pkill:*)",
-      "Bash(./venv/bin/mjpython:*)"
+      "Bash(./venv/bin/mjpython:*)",
+      "Bash(ffprobe:*)"
     ]
   }
 }

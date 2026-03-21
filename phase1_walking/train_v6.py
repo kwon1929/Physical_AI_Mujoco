@@ -1,14 +1,14 @@
-"""Train G1 with v6 environment (V5 + Upright Bonus)."""
+"""Train G1 with v6 environment (V6h: pitch 강화 + height 조정 + 약한 lateral, 8M)."""
 import multiprocessing
 
 import gymnasium as gym
 import torch.nn as nn
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize, DummyVecEnv
-from stable_baselines3.common.callbacks import CallbackList
+from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
 
 from phase1_walking import config_v6 as config
-from phase1_walking.callbacks import make_eval_callback, ProgressCallback
+from phase1_walking.callbacks import EvalByDistanceCallback, ProgressCallback
 from phase1_walking.g1_env_v6 import G1WalkEnvV6  # noqa: F401 (register env)
 
 
@@ -18,10 +18,20 @@ def make_env(rank: int, seed: int = 0):
         env = gym.make(
             config.ENV_ID,
             forward_reward_weight=config.FORWARD_REWARD_WEIGHT,
+            forward_sigma=config.FORWARD_SIGMA,
+            target_velocity=config.TARGET_VELOCITY,
             upright_reward_weight=config.UPRIGHT_REWARD_WEIGHT,
             upright_sigma=config.UPRIGHT_SIGMA,
+            upright_pitch_sigma=config.UPRIGHT_PITCH_SIGMA,
+            height_reward_weight=config.HEIGHT_REWARD_WEIGHT,
+            height_sigma=config.HEIGHT_SIGMA,
+            target_height=config.TARGET_HEIGHT,
             healthy_reward=config.HEALTHY_REWARD,
             ctrl_cost_weight=config.CTRL_COST_WEIGHT,
+            single_foot_reward_weight=config.SINGLE_FOOT_REWARD_WEIGHT,
+            contact_threshold=config.CONTACT_THRESHOLD,
+            lateral_vel_cost_weight=config.LATERAL_VEL_COST_WEIGHT,
+            lateral_pos_cost_weight=config.LATERAL_POS_COST_WEIGHT,
             healthy_z_range=config.HEALTHY_Z_RANGE,
             max_roll_pitch=config.MAX_ROLL_PITCH,
             action_scale=config.ACTION_SCALE,
@@ -34,17 +44,22 @@ def make_env(rank: int, seed: int = 0):
 
 def main():
     print("=" * 60)
-    print(" G1 Walking Training v6 (V5 + Upright Bonus)")
-    print(" Ablation Step 1: upright_reward only")
+    print(" G1 Walking Training V6g-fix")
+    print(" V6f + Fixed Foot Contact, No Lateral (8M)")
+    print(" EvalCallback: best by forward distance")
     print("=" * 60)
     print(f"\n  ENV: {config.ENV_ID}")
     print(f"  N_ENVS: {config.N_ENVS}")
     print(f"  TOTAL_TIMESTEPS: {config.TOTAL_TIMESTEPS:,}")
     print(f"  DEVICE: {config.DEVICE}")
-    print(f"\n  forward (linear * {config.FORWARD_REWARD_WEIGHT})")
+    print(f"  ACTION_SCALE: {config.ACTION_SCALE}")
+    print(f"\n  forward ({config.FORWARD_REWARD_WEIGHT} * exp(-{config.FORWARD_SIGMA} * (vel-{config.TARGET_VELOCITY})^2))")
     print(f"  + upright ({config.UPRIGHT_REWARD_WEIGHT} * exp(-{config.UPRIGHT_SIGMA} * angle^2))")
+    print(f"  + height ({config.HEIGHT_REWARD_WEIGHT} * exp(-{config.HEIGHT_SIGMA} * (z-{config.TARGET_HEIGHT})^2))")
+    print(f"  + single_foot ({config.SINGLE_FOOT_REWARD_WEIGHT}, threshold={config.CONTACT_THRESHOLD:.1f}N)")
     print(f"  + healthy ({config.HEALTHY_REWARD})")
     print(f"  - ctrl_cost ({config.CTRL_COST_WEIGHT})")
+    print(f"  - lateral ({config.LATERAL_VEL_COST_WEIGHT}*vy^2 + {config.LATERAL_POS_COST_WEIGHT}*y^2)")
     print(f"  termination: z>{config.HEALTHY_Z_RANGE[0]}m, roll/pitch<{config.MAX_ROLL_PITCH}rad\n")
 
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -78,18 +93,23 @@ def main():
     )
 
     # 콜백
-    eval_callback = make_eval_callback(
+    eval_callback = EvalByDistanceCallback(
         eval_env=eval_env,
-        log_dir=config.LOG_DIR,
         model_dir=config.MODEL_DIR,
+        log_dir=config.LOG_DIR,
         eval_freq=config.EVAL_FREQ,
         n_eval_episodes=config.N_EVAL_EPISODES,
+    )
+    checkpoint_callback = CheckpointCallback(
+        save_freq=config.CHECKPOINT_FREQ // config.N_ENVS,  # per-env steps
+        save_path=str(config.MODEL_DIR / "checkpoints"),
+        name_prefix="v6g_fix",
     )
     progress_callback = ProgressCallback(
         total_timesteps=config.TOTAL_TIMESTEPS,
         print_freq=10000,
     )
-    callbacks = CallbackList([eval_callback, progress_callback])
+    callbacks = CallbackList([eval_callback, checkpoint_callback, progress_callback])
 
     # PPO 모델
     print("Creating PPO model...")

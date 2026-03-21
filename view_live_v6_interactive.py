@@ -18,12 +18,12 @@ from phase1_walking.g1_env_v6 import G1WalkEnvV6  # noqa: F401 (register env)
 
 def main():
     print("=" * 60)
-    print(" G1 v6 - Interactive Viewer")
-    print(" (V5 + Upright Bonus)")
+    print(" G1 V6g-fix - Interactive Viewer")
+    print(" (Fixed Foot Contact, No Lateral)")
     print("=" * 60)
 
-    model_path = Path("models/ppo_g1_v6/best_model")
-    vec_normalize_path = Path("models/ppo_g1_v6/vec_normalize.pkl")
+    model_path = Path("models/ppo_g1_v6g_fix/final_model")
+    vec_normalize_path = Path("models/ppo_g1_v6g_fix/vec_normalize.pkl")
 
     if not model_path.with_suffix(".zip").exists():
         print("Model not found. Run training first:")
@@ -36,10 +36,19 @@ def main():
         return gym.make(
             config.ENV_ID,
             forward_reward_weight=config.FORWARD_REWARD_WEIGHT,
+            forward_sigma=config.FORWARD_SIGMA,
+            target_velocity=config.TARGET_VELOCITY,
             upright_reward_weight=config.UPRIGHT_REWARD_WEIGHT,
             upright_sigma=config.UPRIGHT_SIGMA,
+            height_reward_weight=config.HEIGHT_REWARD_WEIGHT,
+            height_sigma=config.HEIGHT_SIGMA,
+            target_height=config.TARGET_HEIGHT,
             healthy_reward=config.HEALTHY_REWARD,
             ctrl_cost_weight=config.CTRL_COST_WEIGHT,
+            single_foot_reward_weight=config.SINGLE_FOOT_REWARD_WEIGHT,
+            contact_threshold=config.CONTACT_THRESHOLD,
+            lateral_vel_cost_weight=config.LATERAL_VEL_COST_WEIGHT,
+            lateral_pos_cost_weight=config.LATERAL_POS_COST_WEIGHT,
             healthy_z_range=config.HEALTHY_Z_RANGE,
             max_roll_pitch=config.MAX_ROLL_PITCH,
             action_scale=config.ACTION_SCALE,

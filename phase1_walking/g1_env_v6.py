@@ -1,20 +1,23 @@
-"""Unitree G1 환경 v6 - V5 + Upright Bonus (Ablation Step 1)
+"""Unitree G1 환경 v6 - Ablation Reward Engineering
 
-V5 기반 + upright bonus만 추가:
-- V5: 선형 forward reward + stability termination
-- V6 추가: upright_reward = weight * exp(-sigma * (roll^2 + pitch^2))
+Ablation history:
+- V6a: V5 + upright bonus
+- V6b: V6a + height bonus
+- V6e: forward를 exp(target_vel) + action_scale 축소
+- V6f: forward exp 폭 축소 (sigma 1.0→4.0) — 서있기 local optimum 탈출
+- V6g: single foot contact + lateral penalty — pitch 안정화 + 직진 유도
+- V6h: pitch 계수 2배 + height 조정 + 약한 lateral 재추가
 
-보상 구조:
-  reward = forward_velocity * 10.0      (선형, 걸어야만 보상)
-         + upright_reward * 3.0          (NEW: 직립 보너스)
-         + healthy_reward * 0.5          (서있기만으론 부족)
-         - ctrl_cost * 0.001            (최소 페널티)
+보상 구조 (V6h):
+  reward = fw_weight * exp(-fw_sigma * (vel - target_vel)^2)        (목표 속도)
+         + upright_weight * exp(-sigma_r * roll^2 - sigma_p * pitch^2) (직립, pitch 강화)
+         + height_weight * exp(-sigma_h * (z - target_h)^2)         (높이)
+         + single_foot * (left XOR right contact)                    (발 교대)
+         + healthy_reward * 0.5
+         - ctrl_cost * 0.001
+         - lateral_vel_cost * vy^2                                   (횡방향 속도)
+         - lateral_pos_cost * y^2                                    (횡방향 표류)
   termination: z < 0.5m OR roll/pitch > 0.8 rad
-
-Ablation:
-  V6a = V5 + upright only (이 파일)
-  V6b = V6a + height bonus (추후)
-  V6c = V6b + lateral penalty (추후)
 """
 import numpy as np
 import gymnasium as gym
@@ -26,7 +29,7 @@ from phase1_walking.config import MENAGERIE_DIR
 
 
 class G1WalkEnvV6(gym.Env):
-    """Unitree G1 보행 학습 환경 v6 (V5 + Upright Bonus)."""
+    """Unitree G1 보행 학습 환경 v6h (pitch 강화 + height 조정 + 약한 lateral)."""
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 50}
 
@@ -34,27 +37,48 @@ class G1WalkEnvV6(gym.Env):
         self,
         render_mode: str | None = None,
         # Reward weights
-        forward_reward_weight: float = 10.0,
-        upright_reward_weight: float = 3.0,   # NEW: 직립 보너스
-        upright_sigma: float = 5.0,            # NEW: exp 감쇠 계수
+        forward_reward_weight: float = 5.0,    # V6f: exp 기반 forward
+        forward_sigma: float = 4.0,            # V6f: exp 폭 (1.0→4.0, 서있기 방지)
+        target_velocity: float = 0.5,          # 목표 속도 (m/s)
+        upright_reward_weight: float = 3.0,
+        upright_sigma: float = 5.0,
+        upright_pitch_sigma: float = 10.0,     # V6h: pitch 계수 (roll과 분리)
+        height_reward_weight: float = 2.5,     # V6h: 2.0→2.5
+        height_sigma: float = 15.0,            # V6h: 10.0→15.0
+        target_height: float = 0.75,           # V6h: 0.73→0.75
         healthy_reward: float = 0.5,
         ctrl_cost_weight: float = 0.001,
+        # V6g: foot contact + lateral
+        single_foot_reward_weight: float = 1.0,
+        contact_threshold: float = 16.4,     # G1 mass(33.34) * 9.81 * 0.05
+        lateral_vel_cost_weight: float = 0.3,
+        lateral_pos_cost_weight: float = 0.2,
         # Termination
         healthy_z_range: tuple[float, float] = (0.5, 1.5),
         max_roll_pitch: float = 0.8,
         # Other
         max_episode_steps: int = 1000,
-        action_scale: float = 0.7,
+        action_scale: float = 0.4,            # V6e: 축소 (0.7→0.4)
         frame_skip: int = 5,
     ):
         super().__init__()
 
         self.render_mode = render_mode
         self.forward_reward_weight = forward_reward_weight
+        self.forward_sigma = forward_sigma
+        self.target_velocity = target_velocity
         self.upright_reward_weight = upright_reward_weight
         self.upright_sigma = upright_sigma
+        self.upright_pitch_sigma = upright_pitch_sigma
+        self.height_reward_weight = height_reward_weight
+        self.height_sigma = height_sigma
+        self.target_height = target_height
         self.healthy_reward = healthy_reward
         self.ctrl_cost_weight = ctrl_cost_weight
+        self.single_foot_reward_weight = single_foot_reward_weight
+        self.contact_threshold = contact_threshold
+        self.lateral_vel_cost_weight = lateral_vel_cost_weight
+        self.lateral_pos_cost_weight = lateral_pos_cost_weight
         self.healthy_z_range = healthy_z_range
         self.max_roll_pitch = max_roll_pitch
         self._max_episode_steps = max_episode_steps
@@ -85,17 +109,19 @@ class G1WalkEnvV6(gym.Env):
         self._step_count = 0
         self._total_forward_distance = 0.0
 
-        # Foot geom IDs
-        try:
-            self._left_foot_geom_id = mujoco.mj_name2id(
-                self.model, mujoco.mjtObj.mjOBJ_GEOM, "left_ankle_roll_link"
-            )
-            self._right_foot_geom_id = mujoco.mj_name2id(
-                self.model, mujoco.mjtObj.mjOBJ_GEOM, "right_ankle_roll_link"
-            )
-        except Exception:
-            self._left_foot_geom_id = self.model.ngeom - 2
-            self._right_foot_geom_id = self.model.ngeom - 1
+        # Foot geom sets (body 기반: ankle_roll_link body에 속한 모든 geom)
+        left_body_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, "left_ankle_roll_link"
+        )
+        right_body_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, "right_ankle_roll_link"
+        )
+        self._left_foot_geoms = set(
+            g for g in range(self.model.ngeom) if self.model.geom_bodyid[g] == left_body_id
+        )
+        self._right_foot_geoms = set(
+            g for g in range(self.model.ngeom) if self.model.geom_bodyid[g] == right_body_id
+        )
 
         # obs_size 계산
         obs_size = self._get_obs().shape[0]
@@ -122,17 +148,32 @@ class G1WalkEnvV6(gym.Env):
         return np.concatenate([qpos, qvel, foot_contacts])
 
     def _get_foot_contacts(self) -> np.ndarray:
-        """발바닥 접촉 감지 (0 or 1)."""
+        """발바닥 접촉 감지 (0 or 1). Body 기반 geom set 사용."""
         contacts = np.zeros(2, dtype=np.float32)
         for i in range(self.data.ncon):
             contact = self.data.contact[i]
-            geom1 = contact.geom1
-            geom2 = contact.geom2
-            if geom1 == self._left_foot_geom_id or geom2 == self._left_foot_geom_id:
+            geoms = {contact.geom1, contact.geom2}
+            if geoms & self._left_foot_geoms:
                 contacts[0] = 1.0
-            if geom1 == self._right_foot_geom_id or geom2 == self._right_foot_geom_id:
+            if geoms & self._right_foot_geoms:
                 contacts[1] = 1.0
         return contacts
+
+    def _get_foot_forces(self) -> tuple[float, float]:
+        """발바닥 접촉 수직력 (N). Body 기반 geom set 사용."""
+        left_force = 0.0
+        right_force = 0.0
+        force_buf = np.zeros(6)
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+            geoms = {contact.geom1, contact.geom2}
+            mujoco.mj_contactForce(self.model, self.data, i, force_buf)
+            normal_force = abs(force_buf[0])
+            if geoms & self._left_foot_geoms:
+                left_force += normal_force
+            if geoms & self._right_foot_geoms:
+                right_force += normal_force
+        return left_force, right_force
 
     def _get_euler_from_quat(self) -> tuple[float, float, float]:
         """쿼터니언 -> 오일러 각도 (roll, pitch, yaw) 변환."""
@@ -187,23 +228,45 @@ class G1WalkEnvV6(gym.Env):
         # ===== 보상 =====
         x_velocity = (x_after - x_before) / self.dt
 
-        # 1) Forward reward (선형, V5와 동일)
-        forward_reward = self.forward_reward_weight * x_velocity
+        # 1) Forward reward (V6f: sigma=4.0으로 폭 축소, 서있기 방지)
+        forward_reward = self.forward_reward_weight * np.exp(
+            -self.forward_sigma * ((x_velocity - self.target_velocity) ** 2)
+        )
 
-        # 2) Upright reward (NEW: V6a 핵심)
+        # 2) Upright reward (V6h: pitch 계수 분리)
         roll = self.roll
         pitch = self.pitch
         upright_reward = self.upright_reward_weight * np.exp(
-            -self.upright_sigma * (roll**2 + pitch**2)
+            -self.upright_sigma * roll**2 - self.upright_pitch_sigma * pitch**2
         )
 
-        # 3) Healthy reward
+        # 3) Height reward (V6b)
+        z = self.pelvis_height
+        height_reward = self.height_reward_weight * np.exp(
+            -self.height_sigma * (z - self.target_height)**2
+        )
+
+        # 4) Healthy reward
         healthy_reward = self.healthy_reward if self.is_healthy else 0.0
 
-        # 4) Control cost
+        # 5) Control cost
         ctrl_cost = self.ctrl_cost_weight * np.sum(np.square(action))
 
-        reward = forward_reward + upright_reward + healthy_reward - ctrl_cost
+        # 6) Single foot contact reward (V6g: 발 교대 유도)
+        left_force, right_force = self._get_foot_forces()
+        left_contact = left_force > self.contact_threshold
+        right_contact = right_force > self.contact_threshold
+        single_foot_reward = self.single_foot_reward_weight * float(left_contact != right_contact)
+
+        # 7) Lateral cost (V6g: 횡방향 표류 방지)
+        y_position = self.data.qpos[1]
+        y_velocity = self.data.qvel[1]
+        lateral_cost = (self.lateral_vel_cost_weight * y_velocity**2
+                        + self.lateral_pos_cost_weight * y_position**2)
+
+        reward = (forward_reward + upright_reward + height_reward
+                  + single_foot_reward + healthy_reward
+                  - ctrl_cost - lateral_cost)
 
         # 종료 조건
         terminated = not self.is_healthy
@@ -216,13 +279,20 @@ class G1WalkEnvV6(gym.Env):
         info = {
             "x_position": x_after,
             "x_velocity": x_velocity,
+            "y_position": y_position,
+            "y_velocity": y_velocity,
             "pelvis_height": self.pelvis_height,
             "roll": roll,
             "pitch": pitch,
             "forward_reward": forward_reward,
             "upright_reward": upright_reward,
+            "height_reward": height_reward,
+            "single_foot_reward": single_foot_reward,
             "healthy_reward": healthy_reward,
             "ctrl_cost": ctrl_cost,
+            "lateral_cost": lateral_cost,
+            "left_foot_force": left_force,
+            "right_foot_force": right_force,
             "total_forward_distance": self._total_forward_distance,
             "foot_contacts": self._get_foot_contacts(),
         }
